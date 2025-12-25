@@ -886,6 +886,15 @@ function makeWellBehavingResolver(resolve) {
 var resolveSrv = makeWellBehavingResolver(dns.resolveSrv);
 var resolve4 = makeWellBehavingResolver(dns.resolve4);
 var resolve6 = makeWellBehavingResolver(dns.resolve6);
+var resolveNaptr = makeWellBehavingResolver(dns.resolveNaptr);
+
+// NAPTR service to protocol mapping per RFC 3263
+var naptrServices = {
+  'SIP+D2T': 'tcp',   // SIP over TCP
+  'SIP+D2U': 'udp',   // SIP over UDP
+  'SIP+D2S': 'sctp',  // SIP over SCTP
+  'SIPS+D2T': 'tls'   // SIP over TLS
+};
 
 function resolve(uri, action) {
   if(uri.params.transport === 'ws')
@@ -917,41 +926,150 @@ function resolve(uri, action) {
     });
   }
   else {
-    var protocols = uri.params.transport ? [uri.params.transport] : ['tcp', 'udp', 'tls'];
-  
-    var n = protocols.length;
-    var addresses = [];
+    // Helper function to resolve SRV records for given protocols (existing behavior)
+    function resolveSrvForProtocols(protocols, host, callback) {
+      var n = protocols.length;
+      var addresses = [];
 
-    protocols.forEach(function(proto) {
-      resolveSrv('_sip._'+proto+'.'+uri.host, function(e, r) {
-        --n;
-        
-        if(Array.isArray(r)) {
-          n += r.length;
-          r.forEach(function(srv) {
-            resolve46(srv.name, function(e, r) {
-              addresses = addresses.concat((r||[]).map(function(a) { return {protocol: proto, address: a, port: srv.port};}));
-            
-              if((--n)===0) // all outstanding requests has completed
-                action(addresses);
+      protocols.forEach(function(proto) {
+        resolveSrv('_sip._'+proto+'.'+host, function(e, r) {
+          --n;
+
+          if(Array.isArray(r)) {
+            n += r.length;
+            r.forEach(function(srv) {
+              resolve46(srv.name, function(e, r) {
+                addresses = addresses.concat((r||[]).map(function(a) { return {protocol: proto, address: a, port: srv.port};}));
+
+                if((--n)===0) // all outstanding requests have completed
+                  callback(addresses);
+              });
             });
+          }
+          else if(0 === n) {
+            if(addresses.length) {
+              callback(addresses);
+            }
+            else {
+              // all srv requests failed, fallback to A/AAAA
+              resolve46(host, function(err, address) {
+                address = (address || []).map(function(x) { return protocols.map(function(p) { return { protocol: p, address: x, port: defaultPort(p)};});})
+                  .reduce(function(arr,v) { return arr.concat(v); }, []);
+                callback(address);
+              });
+            }
+          }
+        });
+      });
+    }
+
+    // Helper function to resolve addresses from NAPTR records
+    function resolveFromNaptr(naptrRecords, callback) {
+      // Sort NAPTR records by order, then by preference (lower values = higher priority)
+      naptrRecords.sort(function(a, b) {
+        return (a.order - b.order) || (a.preference - b.preference);
+      });
+
+      // Filter for SIP-related services and extract protocol info
+      var sipRecords = naptrRecords.filter(function(r) {
+        return naptrServices[r.service];
+      });
+
+      if(sipRecords.length === 0) {
+        return callback(null); // No SIP NAPTR records, trigger fallback
+      }
+
+      var addresses = [];
+      var pending = sipRecords.length;
+
+      sipRecords.forEach(function(naptr) {
+        var proto = naptrServices[naptr.service];
+        var flags = (naptr.flags || '').toLowerCase();
+
+        if(flags === 's') {
+          // 's' flag: replacement is an SRV target
+          resolveSrv(naptr.replacement, function(e, srvRecords) {
+            if(Array.isArray(srvRecords) && srvRecords.length > 0) {
+              var srvPending = srvRecords.length;
+              srvRecords.forEach(function(srv) {
+                resolve46(srv.name, function(e, addrs) {
+                  addresses = addresses.concat((addrs||[]).map(function(a) {
+                    return {protocol: proto, address: a, port: srv.port, order: naptr.order, preference: naptr.preference};
+                  }));
+                  if(--srvPending === 0 && --pending === 0) {
+                    finalize();
+                  }
+                });
+              });
+            } else {
+              if(--pending === 0) finalize();
+            }
+          });
+        } else if(flags === 'a') {
+          // 'a' flag: replacement is a hostname for A/AAAA lookup
+          resolve46(naptr.replacement, function(e, addrs) {
+            addresses = addresses.concat((addrs||[]).map(function(a) {
+              return {protocol: proto, address: a, port: defaultPort(proto), order: naptr.order, preference: naptr.preference};
+            }));
+            if(--pending === 0) finalize();
+          });
+        } else {
+          // Empty or unknown flags: treat replacement as SRV target (common case)
+          resolveSrv(naptr.replacement, function(e, srvRecords) {
+            if(Array.isArray(srvRecords) && srvRecords.length > 0) {
+              var srvPending = srvRecords.length;
+              srvRecords.forEach(function(srv) {
+                resolve46(srv.name, function(e, addrs) {
+                  addresses = addresses.concat((addrs||[]).map(function(a) {
+                    return {protocol: proto, address: a, port: srv.port, order: naptr.order, preference: naptr.preference};
+                  }));
+                  if(--srvPending === 0 && --pending === 0) {
+                    finalize();
+                  }
+                });
+              });
+            } else {
+              if(--pending === 0) finalize();
+            }
           });
         }
-        else if(0 === n) {
-          if(addresses.length) {
-            action(addresses);
-          }
-          else {
-            // all srv requests failed
-            resolve46(uri.host, function(err, address) {
-              address = (address || []).map(function(x) { return protocols.map(function(p) { return { protocol: p, address: x, port: uri.port || defaultPort(p)};});})
-                .reduce(function(arr,v) { return arr.concat(v); }, []);
-              action(address);
-            });
-          }
+      });
+
+      function finalize() {
+        // Sort final addresses by NAPTR order/preference
+        addresses.sort(function(a, b) {
+          return (a.order - b.order) || (a.preference - b.preference);
+        });
+        // Remove order/preference from final result
+        addresses = addresses.map(function(a) {
+          return {protocol: a.protocol, address: a.address, port: a.port};
+        });
+        callback(addresses);
+      }
+    }
+
+    // If transport is explicitly specified, skip NAPTR and use SRV directly
+    if(uri.params.transport) {
+      resolveSrvForProtocols([uri.params.transport], uri.host, action);
+    }
+    else {
+      // RFC 3263: Try NAPTR first, then fall back to SRV
+      resolveNaptr(uri.host, function(err, naptrRecords) {
+        if(naptrRecords && naptrRecords.length > 0) {
+          resolveFromNaptr(naptrRecords, function(addresses) {
+            if(addresses && addresses.length > 0) {
+              action(addresses);
+            } else {
+              // NAPTR records existed but yielded no addresses, fall back to SRV
+              resolveSrvForProtocols(['tcp', 'udp', 'tls'], uri.host, action);
+            }
+          });
+        } else {
+          // No NAPTR records, fall back to SRV queries
+          resolveSrvForProtocols(['tcp', 'udp', 'tls'], uri.host, action);
         }
-      })
-    });
+      });
+    }
   }
 }
 
